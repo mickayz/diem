@@ -8,6 +8,7 @@ use config_builder::ValidatorConfig;
 use libra_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     test_utils::KeyPair,
+    Uniform,
 };
 use libra_types::{chain_id::ChainId, waypoint::Waypoint};
 use rand::prelude::*;
@@ -31,6 +32,7 @@ impl Cluster {
         peers: Vec<(String, u32, Option<u32>)>,
         mint_file: &str,
         chain_id: ChainId,
+        premainnet: bool,
     ) -> Self {
         let http_client = Client::new();
         let instances: Vec<Instance> = peers
@@ -45,8 +47,14 @@ impl Cluster {
                 )
             })
             .collect();
-        let mint_key: Ed25519PrivateKey = generate_key::load_key(mint_file);
-        let mint_key_pair = KeyPair::from(mint_key);
+
+        let mint_key_pair = if premainnet {
+            let keypair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> =
+                Ed25519PrivateKey::generate_for_testing().into();
+            keypair
+        } else {
+            KeyPair::from(generate_key::load_key(mint_file))
+        };
         Self {
             validator_instances: instances,
             fullnode_instances: vec![],

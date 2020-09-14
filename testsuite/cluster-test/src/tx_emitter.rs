@@ -35,6 +35,7 @@ use rand::{
 use tokio::runtime::Handle;
 
 use futures::future::{try_join_all, FutureExt};
+use libra_json_rpc_client::views::AmountView;
 use libra_json_rpc_client::JsonRpcAsyncClient;
 use libra_types::transaction::SignedTransaction;
 use once_cell::sync::Lazy;
@@ -46,11 +47,14 @@ use std::{
 use tokio::{task::JoinHandle, time};
 
 const MAX_TXN_BATCH_SIZE: usize = 100; // Max transactions per account in mempool
+const DD_KEY: &str = "dd.key";
+const VASP_KEY: &str = "vasp.key";
 
 pub struct TxEmitter {
     accounts: Vec<AccountData>,
     mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
     chain_id: ChainId,
+    premainnet: bool,
 }
 
 pub struct EmitJob {
@@ -160,11 +164,12 @@ impl EmitJobRequest {
 }
 
 impl TxEmitter {
-    pub fn new(cluster: &Cluster) -> Self {
+    pub fn new(cluster: &Cluster, premainnet: bool) -> Self {
         Self {
             accounts: vec![],
             mint_key_pair: cluster.mint_key_pair().clone(),
             chain_id: cluster.chain_id,
+            premainnet,
         }
     }
 
@@ -190,11 +195,18 @@ impl TxEmitter {
     pub async fn submit_single_transaction(
         &self,
         instance: &Instance,
-        account: &mut AccountData,
+        sender: &mut AccountData,
+        receiver: &AccountAddress,
+        num_coins: u64,
     ) -> Result<Instant> {
         let client = instance.json_rpc_client();
         client
-            .submit_transaction(gen_mint_request(account, 10, self.chain_id))
+            .submit_transaction(gen_transfer_txn_request(
+                sender,
+                receiver,
+                num_coins,
+                self.chain_id,
+            ))
             .await?;
         let deadline = Instant::now() + TXN_MAX_WAIT;
         Ok(deadline)
@@ -260,8 +272,22 @@ impl TxEmitter {
         })
     }
 
-    pub async fn load_faucet_account(&self, instance: &Instance) -> Result<AccountData> {
-        let client = instance.json_rpc_client();
+    pub async fn retrieve_account_balance(
+        &self,
+        client: &JsonRpcAsyncClient,
+        address: AccountAddress,
+    ) -> Result<Vec<AmountView>> {
+        let resp = client
+            .get_accounts(&[address])
+            .await
+            .map_err(|e| format_err!("[{:?}] get_accounts failed: {:?} ", client, e))?;
+        Ok(resp[0]
+            .clone()
+            .ok_or_else(|| format_err!("account does not exist"))?
+            .balances)
+    }
+
+    pub async fn load_faucet_account(&self, client: &JsonRpcAsyncClient) -> Result<AccountData> {
         let address = testnet_dd_account_address();
         let sequence_number = query_sequence_numbers(&client, &[address])
             .await
@@ -279,8 +305,7 @@ impl TxEmitter {
         })
     }
 
-    pub async fn load_tc_account(&self, instance: &Instance) -> Result<AccountData> {
-        let client = instance.json_rpc_client();
+    pub async fn load_tc_account(&self, client: &JsonRpcAsyncClient) -> Result<AccountData> {
         let address = account_config::treasury_compliance_account_address();
         let sequence_number = query_sequence_numbers(&client, &[address])
             .await
@@ -298,6 +323,103 @@ impl TxEmitter {
         })
     }
 
+    pub async fn load_dd_account(&self, client: &JsonRpcAsyncClient) -> Result<AccountData> {
+        let mint_key: Ed25519PrivateKey = generate_key::load_key(DD_KEY);
+        let mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> = KeyPair::from(mint_key);
+        let address = libra_types::account_address::from_public_key(&mint_key_pair.public_key);
+        let sequence_number = query_sequence_numbers(&client, &[address])
+            .await
+            .map_err(|e| {
+                format_err!(
+                    "query_sequence_numbers on {:?} for dd account failed: {}",
+                    client,
+                    e
+                )
+            })?[0];
+        Ok(AccountData {
+            address,
+            key_pair: mint_key_pair.clone(),
+            sequence_number,
+        })
+    }
+
+    pub async fn load_vasp_account(&self, client: &JsonRpcAsyncClient) -> Result<AccountData> {
+        let mint_key: Ed25519PrivateKey = generate_key::load_key(VASP_KEY);
+        let mint_key_pair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> = KeyPair::from(mint_key);
+        let address = libra_types::account_address::from_public_key(&mint_key_pair.public_key);
+        let sequence_number = query_sequence_numbers(&client, &[address])
+            .await
+            .map_err(|e| {
+                format_err!(
+                    "query_sequence_numbers on {:?} for dd account failed: {}",
+                    client,
+                    e
+                )
+            })?[0];
+        Ok(AccountData {
+            address,
+            key_pair: mint_key_pair.clone(),
+            sequence_number,
+        })
+    }
+
+    pub async fn get_money_source(
+        &self,
+        instances: &Vec<Instance>,
+        coins_total: u64,
+    ) -> Result<AccountData> {
+        let client = self.pick_mint_instance(instances).json_rpc_client();
+        let faucet_account = if !self.premainnet {
+            info!("Creating and minting faucet account");
+            let mut account = self.load_faucet_account(&client).await?;
+            let mint_txn = gen_mint_request(&mut account, coins_total, self.chain_id);
+            execute_and_wait_transactions(
+                &mut self.pick_mint_client(instances),
+                &mut account,
+                vec![mint_txn],
+            )
+            .await
+            .map_err(|e| format_err!("Failed to mint into faucet account: {}", e))?;
+            account
+        } else {
+            info!("Loading faucet account from DD account");
+            self.load_dd_account(&client).await?
+        };
+        info!(
+            "DD account current balances are {:?}, requested {} coins",
+            self.retrieve_account_balance(&client, faucet_account.address)
+                .await?,
+            coins_total
+        );
+        Ok(faucet_account)
+    }
+
+    pub async fn get_seed_accounts(&self, instances: &Vec<Instance>) -> Result<Vec<AccountData>> {
+        let client = self.pick_mint_instance(instances).json_rpc_client();
+        let seed_accounts = if !self.premainnet {
+            info!("Creating and minting seeds accounts");
+            let mut account = self.load_tc_account(&client).await?;
+            let seed_accounts = create_seed_accounts(
+                &mut account,
+                instances.len(),
+                100,
+                self.pick_mint_client(instances),
+                self.chain_id,
+            )
+            .await
+            .map_err(|e| format_err!("Failed to create seed accounts: {}", e))?;
+            info!("Completed creating seed accounts");
+            seed_accounts
+        } else {
+            let mut seed_accounts = vec![];
+            info!("Loading VASP account as seed accounts");
+            let account = self.load_vasp_account(&client).await?;
+            seed_accounts.push(account);
+            seed_accounts
+        };
+        Ok(seed_accounts)
+    }
+
     pub async fn mint_accounts(
         &mut self,
         req: &EmitJobRequest,
@@ -308,38 +430,14 @@ impl TxEmitter {
             return Ok(()); // Early return to skip printing 'Minting ...' logs
         }
         let num_accounts = requested_accounts - self.accounts.len(); // Only minting extra accounts
-        info!("Minting additional {} accounts", num_accounts);
-        let mut faucet_account = self
-            .load_faucet_account(self.pick_mint_instance(&req.instances))
-            .await?;
-        let mut tc_account = self
-            .load_tc_account(self.pick_mint_instance(&req.instances))
-            .await?;
         let coins_per_account = (SEND_AMOUNT + *GAS_UNIT_PRICE) * MAX_TXNS;
-        info!("Minting additional {} accounts", num_accounts);
         let coins_per_seed_account =
             (coins_per_account * num_accounts as u64) / req.instances.len() as u64;
         let coins_total = coins_per_account * num_accounts as u64;
-        let mint_txn = gen_mint_request(&mut faucet_account, coins_total, self.chain_id);
-        execute_and_wait_transactions(
-            &mut self.pick_mint_client(&req.instances),
-            &mut faucet_account,
-            vec![mint_txn],
-        )
-        .await
-        .map_err(|e| format_err!("Failed to mint into faucet account: {}", e))?;
 
-        let seed_accounts = create_seed_accounts(
-            &mut tc_account,
-            req.instances.len(),
-            100,
-            self.pick_mint_client(&req.instances),
-            self.chain_id,
-        )
-        .await
-        .map_err(|e| format_err!("Failed to create seed accounts: {}", e))?;
-        info!("Completed creating seed accounts");
+        let mut faucet_account = self.get_money_source(&req.instances, coins_total).await?;
         // Create seed accounts with which we can create actual accounts concurrently
+        let seed_accounts = self.get_seed_accounts(&req.instances).await?;
         mint_to_new_accounts(
             &mut faucet_account,
             &seed_accounts,
@@ -351,6 +449,8 @@ impl TxEmitter {
         .await
         .map_err(|e| format_err!("Failed to mint seed_accounts: {}", e))?;
         info!("Completed minting seed accounts");
+        info!("Minting additional {} accounts", num_accounts);
+
         // For each seed account, create a future and transfer libra from that seed account to new accounts
         let account_futures = seed_accounts
             .into_iter()
